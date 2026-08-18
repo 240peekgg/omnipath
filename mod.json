@@ -8,7 +8,7 @@
   },
   "id": "openai.omnipath",
   "name": "OmniPath Prototype",
-  "version": "v0.2.0",
+  "version": "v0.3.0",
   "developer": "prototype",
-  "description": "Classic-mode TAS pathfinder prototype with evolution, guided mutation, PATH death-map learning, and 10-100 generation batches"
+  "description": "Object-aware FRONTIER planner with real 10-100 candidate generations, mode-aware controls, ghost trajectories, touch lock, smart training speed, and macro saving"
 }
