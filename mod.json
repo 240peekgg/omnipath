@@ -8,7 +8,7 @@
   },
   "id": "openai.omnipath",
   "name": "OmniPath Prototype",
-  "version": "v0.1.0",
+  "version": "v0.2.0",
   "developer": "prototype",
-  "description": "Experimental classic-mode pathfinder using real GD attempts and evolutionary search"
+  "description": "Classic-mode TAS pathfinder prototype with evolution, guided mutation, PATH death-map learning, and 10-100 generation batches"
 }
