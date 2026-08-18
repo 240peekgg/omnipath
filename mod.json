@@ -1,0 +1,14 @@
+{
+  "geode": "5.0.0",
+  "gd": {
+    "android": "2.2081",
+    "win": "2.2081",
+    "mac": "2.2081",
+    "ios": "2.2081"
+  },
+  "id": "openai.omnipath",
+  "name": "OmniPath Prototype",
+  "version": "v0.1.0",
+  "developer": "prototype",
+  "description": "Experimental classic-mode pathfinder using real GD attempts and evolutionary search"
+}
