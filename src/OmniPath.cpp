@@ -1,19 +1,24 @@
 #include <Geode/Geode.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/LevelInfoLayer.hpp>
+#include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/ui/Popup.hpp>
 #include <Geode/ui/TextInput.hpp>
+#include <Geode/utils/cocos.hpp>
 
 #include "SolverCore.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 
 using namespace geode::prelude;
 
@@ -22,29 +27,42 @@ namespace {
 struct PendingConfig {
     bool armed = false;
     std::string macroName = "omnipath-run";
-    omnipath::SearchMode mode = omnipath::SearchMode::Path;
-    std::uint32_t decisionTicks = 1;
-    std::uint32_t batchGenerations = 30;
+    std::uint32_t candidates = 100;
+    std::uint32_t maxGenerations = 100;
 };
 
 PendingConfig g_pending;
 
 struct LiveSession {
     bool active = false;
+    bool injectingInput = false;
+    bool ignoreTouch = true;
+    bool ghosts = true;
+    int trainingSpeed = 4;
+    int appliedSpeed = 1;
+    float baseTimeScale = 1.0f;
+
     std::string macroName;
-    omnipath::SearchMode mode = omnipath::SearchMode::Path;
-    std::unique_ptr<omnipath::EvolutionSolver> solver;
+    std::unique_ptr<omnipath::FrontierPlanner> solver;
     std::uint32_t tick = 0;
+    std::uint32_t maxGenerations = 100;
     bool p1Down = false;
     bool p2Down = false;
     int deadTicks = 0;
-    std::uint32_t batchGenerations = 30;
     float lastX = 0.0f;
     float lastY = 0.0f;
+    float maxX = 0.0f;
     float lastSavedBest = -1.0f;
+
     CCLabelBMFont* hudMain = nullptr;
     CCLabelBMFont* hudStats = nullptr;
     CCLabelBMFont* hudHistory = nullptr;
+    CCDrawNode* ghostDraw = nullptr;
+    std::vector<GameObject*> scanObjects;
+    std::vector<std::vector<CCPoint>> trails;
+    std::vector<CCPoint> currentTrail;
+    std::size_t leaderIndex = 0;
+    float leaderProgress = 0.0f;
 };
 
 LiveSession g_live;
@@ -57,15 +75,168 @@ std::string sanitizeName(std::string name) {
     return name;
 }
 
+omnipath::PlayerMode playerMode(PlayerObject* p) {
+    if (!p) return omnipath::PlayerMode::Unknown;
+    if (p->m_isDart) return omnipath::PlayerMode::Wave;
+    if (p->m_isShip) return omnipath::PlayerMode::Ship;
+    if (p->m_isBird) return omnipath::PlayerMode::Ufo;
+    if (p->m_isBall) return omnipath::PlayerMode::Ball;
+    if (p->m_isRobot) return omnipath::PlayerMode::Robot;
+    if (p->m_isSpider) return omnipath::PlayerMode::Spider;
+    if (p->m_isSwing) return omnipath::PlayerMode::Swing;
+    return omnipath::PlayerMode::Cube;
+}
+
+bool isObstacle(GameObjectType type) {
+    switch (type) {
+        case GameObjectType::Solid:
+        case GameObjectType::Hazard:
+        case GameObjectType::Slope:
+        case GameObjectType::AnimatedHazard:
+        case GameObjectType::CollisionObject:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool isHazard(GameObjectType type) {
+    return type == GameObjectType::Hazard || type == GameObjectType::AnimatedHazard;
+}
+
+bool isInteractable(GameObjectType type) {
+    switch (type) {
+        case GameObjectType::YellowJumpRing:
+        case GameObjectType::PinkJumpRing:
+        case GameObjectType::GravityRing:
+        case GameObjectType::GreenRing:
+        case GameObjectType::DropRing:
+        case GameObjectType::RedJumpRing:
+        case GameObjectType::CustomRing:
+        case GameObjectType::DashRing:
+        case GameObjectType::GravityDashRing:
+        case GameObjectType::SpiderOrb:
+        case GameObjectType::TeleportOrb:
+            return true;
+        default:
+            return false;
+    }
+}
+
+omnipath::PlayerObservation observePlayer(PlayLayer* layer, PlayerObject* p) {
+    omnipath::PlayerObservation out;
+    if (!layer || !p) {
+        out.active = false;
+        return out;
+    }
+
+    out.mode = playerMode(p);
+    out.x = p->getPositionX();
+    out.y = p->getPositionY();
+    out.yVelocity = p->m_yVelocity;
+    out.playerSpeed = p->m_playerSpeed;
+    out.onGround = p->m_isOnGround;
+    out.upsideDown = p->m_isUpsideDown;
+    out.dashing = p->m_isDashing;
+    out.touchingRing = p->m_touchingRings && p->m_touchingRings->count() > 0;
+
+    float upper = out.y + 210.0f;
+    float lower = out.y - 210.0f;
+    bool foundUpper = false;
+    bool foundLower = false;
+    float bestHazardDx = 99999.0f;
+    float bestHazardDy = 0.0f;
+    float bestInteractableDx = 99999.0f;
+
+    for (auto obj : g_live.scanObjects) {
+        if (!obj || obj == p) continue;
+
+        auto dx = obj->getPositionX() - out.x;
+        if (dx < 4.0f || dx > 300.0f) continue;
+
+        auto dy = obj->getPositionY() - out.y;
+        auto type = obj->getType();
+
+        if (isInteractable(type) && std::abs(dy) < 100.0f && dx < bestInteractableDx) {
+            bestInteractableDx = dx;
+        }
+
+        if (!isObstacle(type)) continue;
+
+        if (dx <= 190.0f) {
+            if (dy >= 18.0f && obj->getPositionY() < upper) {
+                upper = obj->getPositionY();
+                foundUpper = true;
+            }
+            if (dy <= -18.0f && obj->getPositionY() > lower) {
+                lower = obj->getPositionY();
+                foundLower = true;
+            }
+        }
+
+        bool dangerousHeight = std::abs(dy) <= 80.0f || isHazard(type);
+        if (dangerousHeight && dx < bestHazardDx) {
+            bestHazardDx = dx;
+            bestHazardDy = dy;
+        }
+    }
+
+    out.nearestHazardDx = bestHazardDx;
+    out.nearestHazardDy = bestHazardDy;
+    out.hazardAhead = bestHazardDx < 99990.0f;
+    out.nearestInteractableDx = bestInteractableDx;
+    out.interactableAhead = bestInteractableDx < 99990.0f;
+
+    if (foundUpper || foundLower) {
+        if (!foundUpper) upper = lower + 260.0f;
+        if (!foundLower) lower = upper - 260.0f;
+        out.targetY = (upper + lower) * 0.5f;
+        out.corridorHalfHeight = std::max(18.0f, (upper - lower) * 0.5f);
+        out.hasTarget = true;
+    }
+
+    return out;
+}
+
+omnipath::Observation observeWorld(PlayLayer* layer) {
+    omnipath::Observation o;
+    if (!layer) return o;
+    o.p1 = observePlayer(layer, layer->m_player1);
+    o.dual = layer->m_player2 && !layer->m_player2->m_isHidden && layer->m_player2->isVisible();
+    if (o.dual) o.p2 = observePlayer(layer, layer->m_player2);
+    else o.p2.active = false;
+    return o;
+}
+
+void setSpeedMultiplier(int multiplier) {
+    if (!g_live.active) return;
+    multiplier = std::clamp(multiplier, 1, 8);
+    if (g_live.appliedSpeed == multiplier) return;
+    auto scheduler = CCDirector::sharedDirector()->getScheduler();
+    if (!scheduler) return;
+    scheduler->setTimeScale(g_live.baseTimeScale * static_cast<float>(multiplier));
+    g_live.appliedSpeed = multiplier;
+}
+
+void restoreTimeScale() {
+    auto scheduler = CCDirector::sharedDirector()->getScheduler();
+    if (scheduler) scheduler->setTimeScale(g_live.baseTimeScale);
+    g_live.appliedSpeed = 1;
+}
+
 void releaseInputs(PlayLayer* layer) {
     if (!layer) return;
+    g_live.injectingInput = true;
     if (g_live.p1Down) layer->handleButton(false, 1, true);
     if (g_live.p2Down) layer->handleButton(false, 1, false);
+    g_live.injectingInput = false;
     g_live.p1Down = false;
     g_live.p2Down = false;
 }
 
 void applyGene(PlayLayer* layer, omnipath::Gene const& gene) {
+    if (!layer) return;
+    g_live.injectingInput = true;
     if (gene.p1 != g_live.p1Down) {
         layer->handleButton(gene.p1, 1, true);
         g_live.p1Down = gene.p1;
@@ -74,6 +245,7 @@ void applyGene(PlayLayer* layer, omnipath::Gene const& gene) {
         layer->handleButton(gene.p2, 1, false);
         g_live.p2Down = gene.p2;
     }
+    g_live.injectingInput = false;
 }
 
 std::string percentText(float value, int precision = 2) {
@@ -100,12 +272,27 @@ void saveBestMacro(bool force = false) {
         return;
     }
 
+    auto const& p = best.policy;
     out << "{\n";
-    out << "  \"format\": \"omnipath-v2\",\n";
-    out << "  \"mode\": \"" << omnipath::modeName(g_live.mode) << "\",\n";
-    out << "  \"batchGenerations\": " << g_live.batchGenerations << ",\n";
+    out << "  \"format\": \"omnipath-v3\",\n";
+    out << "  \"planner\": \"frontier-object-aware\",\n";
+    out << "  \"population\": " << g_live.solver->populationSize() << ",\n";
     out << "  \"decisionTicks\": " << g_live.solver->decisionEveryTicks() << ",\n";
     out << "  \"bestProgress\": " << best.progress << ",\n";
+    out << "  \"bestMaxX\": " << best.maxX << ",\n";
+    out << "  \"frontierTick\": " << g_live.solver->frontierTick() << ",\n";
+    out << "  \"deathMode\": \"" << omnipath::modeName(best.deathMode) << "\",\n";
+    out << "  \"policy\": {"
+        << "\"hazardLead\":" << p.hazardLead
+        << ",\"orbLead\":" << p.orbLead
+        << ",\"cubeTapTicks\":" << p.cubeTapTicks
+        << ",\"robotHoldTicks\":" << p.robotHoldTicks
+        << ",\"shipDwell\":" << p.shipDwell
+        << ",\"waveDwell\":" << p.waveDwell
+        << ",\"targetBias\":" << p.targetBias
+        << ",\"verticalGain\":" << p.verticalGain
+        << ",\"velocityGain\":" << p.velocityGain
+        << ",\"hysteresis\":" << p.hysteresis << "},\n";
     out << "  \"events\": [\n";
 
     bool prev1 = false, prev2 = false;
@@ -121,79 +308,89 @@ void saveBestMacro(bool force = false) {
         prev1 = g.p1;
         prev2 = g.p2;
     }
-    out << "\n  ],\n";
-
-    out << "  \"deathMap\": [\n";
-    bool firstDeath = true;
-    for (auto const& d : g_live.solver->deathMap()) {
-        if (!firstDeath) out << ",\n";
-        firstDeath = false;
-        out << "    {\"x\":" << d.x
-            << ",\"y\":" << d.y
-            << ",\"progress\":" << d.progress
-            << ",\"tick\":" << d.tick
-            << ",\"hits\":" << d.hits
-            << ",\"action\":\"" << (d.recommendedHold ? "press" : "release")
-            << "\",\"confidence\":" << d.confidence << "}";
-    }
     out << "\n  ]\n}\n";
-    log::info("saved OmniPath macro to {}", path.string());
+    log::info("saved OmniPath v3 macro to {}", path.string());
 }
 
 void createHud(PlayLayer* layer) {
     if (!layer) return;
-
     auto win = CCDirector::sharedDirector()->getWinSize();
 
-    g_live.hudMain = CCLabelBMFont::create("OmniPath", "bigFont.fnt");
+    g_live.hudMain = CCLabelBMFont::create("OmniPath FRONTIER", "bigFont.fnt");
     g_live.hudMain->setAnchorPoint({0.0f, 1.0f});
-    g_live.hudMain->setScale(0.38f);
+    g_live.hudMain->setScale(0.34f);
     g_live.hudMain->setPosition({7.0f, win.height - 7.0f});
     layer->addChild(g_live.hudMain, 100000);
 
     g_live.hudStats = CCLabelBMFont::create("starting...", "bigFont.fnt");
     g_live.hudStats->setAnchorPoint({0.0f, 1.0f});
-    g_live.hudStats->setScale(0.30f);
-    g_live.hudStats->setPosition({7.0f, win.height - 25.0f});
+    g_live.hudStats->setScale(0.27f);
+    g_live.hudStats->setPosition({7.0f, win.height - 23.0f});
     layer->addChild(g_live.hudStats, 100000);
 
     g_live.hudHistory = CCLabelBMFont::create("gen best: -", "bigFont.fnt");
     g_live.hudHistory->setAnchorPoint({0.0f, 1.0f});
-    g_live.hudHistory->setScale(0.25f);
-    g_live.hudHistory->setPosition({7.0f, win.height - 40.0f});
+    g_live.hudHistory->setScale(0.23f);
+    g_live.hudHistory->setPosition({7.0f, win.height - 37.0f});
     layer->addChild(g_live.hudHistory, 100000);
+
+    if (layer->m_objectLayer) {
+        g_live.ghostDraw = CCDrawNode::create();
+        layer->m_objectLayer->addChild(g_live.ghostDraw, 99999);
+    }
 }
 
-void updateHud(PlayLayer* layer, bool completed = false) {
+void redrawGhosts() {
+    if (!g_live.ghostDraw) return;
+    g_live.ghostDraw->clear();
+    if (!g_live.ghosts) return;
+
+    for (std::size_t i = 0; i < g_live.trails.size(); ++i) {
+        auto const& trail = g_live.trails[i];
+        if (trail.size() < 2) continue;
+        bool leader = i == g_live.leaderIndex;
+        ccColor4F color = leader
+            ? ccColor4F{0.35f, 1.0f, 0.42f, 0.62f}
+            : ccColor4F{0.35f, 0.72f, 1.0f, 0.14f};
+        float radius = leader ? 0.75f : 0.32f;
+        for (std::size_t j = 1; j < trail.size(); ++j)
+            g_live.ghostDraw->drawSegment(trail[j - 1], trail[j], radius, color);
+    }
+
+    if (g_live.currentTrail.size() >= 2) {
+        ccColor4F current{1.0f, 0.88f, 0.25f, 0.75f};
+        for (std::size_t j = 1; j < g_live.currentTrail.size(); ++j)
+            g_live.ghostDraw->drawSegment(g_live.currentTrail[j - 1], g_live.currentTrail[j], 0.8f, current);
+    }
+}
+
+void updateHud(PlayLayer* layer, omnipath::Observation const* observation = nullptr, bool completed = false) {
     if (!g_live.solver || !g_live.hudMain || !g_live.hudStats || !g_live.hudHistory) return;
 
-    auto gen = g_live.solver->generation();
-    auto displayGen = std::min<std::size_t>(gen + 1, g_live.batchGenerations);
     auto candidate = g_live.solver->currentIndex() + 1;
-
     std::ostringstream main;
-    main << "OmniPath " << omnipath::modeName(g_live.mode)
-         << "  G " << displayGen << "/" << g_live.batchGenerations
+    main << "FRONTIER  G " << (g_live.solver->generation() + 1)
          << "  C " << candidate << "/" << g_live.solver->populationSize();
     if (completed) main << "  DONE";
     g_live.hudMain->setString(main.str().c_str());
 
-    auto bestProgress = g_live.solver->hasBest() ? g_live.solver->best().progress : 0.0f;
-    auto currentProgress = layer ? layer->getCurrentPercent() : 0.0f;
+    auto best = g_live.solver->hasBest() ? g_live.solver->best().progress : 0.0f;
+    auto now = layer ? layer->getCurrentPercent() : 0.0f;
+    auto mode = observation ? omnipath::modeName(observation->p1.mode) : "-";
 
     std::ostringstream stats;
-    stats << "now " << percentText(currentProgress)
-          << "%  best " << percentText(bestProgress)
-          << "%  deaths " << g_live.solver->deathMap().size()
-          << "  stuck " << g_live.solver->stagnantGenerations();
+    stats << mode << "  now " << percentText(now, 1) << "%"
+          << "  best " << percentText(best, 1) << "%"
+          << "  frontier " << g_live.solver->frontierTick()
+          << "  x" << g_live.appliedSpeed
+          << (g_live.ignoreTouch ? "  TOUCH LOCK" : "  TOUCH ON");
     g_live.hudStats->setString(stats.str().c_str());
 
     auto const& history = g_live.solver->generationHistory();
     std::ostringstream hist;
     hist << "gen best: ";
-    if (history.empty()) {
-        hist << "-";
-    } else {
+    if (history.empty()) hist << "-";
+    else {
         auto begin = history.size() > 8 ? history.size() - 8 : 0;
         for (std::size_t i = begin; i < history.size(); ++i) {
             if (i != begin) hist << " | ";
@@ -203,127 +400,102 @@ void updateHud(PlayLayer* layer, bool completed = false) {
     g_live.hudHistory->setString(hist.str().c_str());
 }
 
+void endTraining(PlayLayer* layer, char const* message) {
+    saveBestMacro(true);
+    releaseInputs(layer);
+    restoreTimeScale();
+    g_live.active = false;
+    updateHud(layer, nullptr, true);
+    if (message) {
+        Notification::create(message, static_cast<CCNode*>(nullptr), 3.0f)->show();
+    }
+}
+
 class OmniPathPopup : public Popup {
 protected:
     TextInput* m_nameInput = nullptr;
-    CCLabelBMFont* m_modeLabel = nullptr;
-    CCLabelBMFont* m_batchLabel = nullptr;
+    CCLabelBMFont* m_candidatesLabel = nullptr;
     LevelInfoLayer* m_owner = nullptr;
-    omnipath::SearchMode m_mode = omnipath::SearchMode::Path;
-    std::uint32_t m_batchGenerations = 30;
+    std::uint32_t m_candidates = 100;
 
-    void refreshMode() {
-        if (m_modeLabel)
-            m_modeLabel->setString(omnipath::modeName(m_mode));
-    }
-
-    void refreshBatch() {
-        if (!m_batchLabel) return;
-        auto text = std::to_string(m_batchGenerations) + " generations";
-        m_batchLabel->setString(text.c_str());
+    void refreshCandidates() {
+        if (!m_candidatesLabel) return;
+        auto text = std::to_string(m_candidates) + " real candidates";
+        m_candidatesLabel->setString(text.c_str());
     }
 
     bool init(LevelInfoLayer* owner) {
-        if (!Popup::init(360.f, 285.f)) return false;
+        if (!Popup::init(360.f, 260.f)) return false;
         m_owner = owner;
-        m_mode = g_pending.mode;
-        m_batchGenerations = std::clamp<std::uint32_t>(g_pending.batchGenerations, 10, 100);
-        setTitle("OmniPath v0.2");
+        m_candidates = std::clamp<std::uint32_t>(g_pending.candidates, 10, 100);
+        setTitle("OmniPath v0.3 FRONTIER");
+
+        auto subtitle = CCLabelBMFont::create("object-aware planner / no random click spam", "goldFont.fnt");
+        subtitle->setScale(.34f);
+        subtitle->setPosition({180.f, 207.f});
+        m_mainLayer->addChild(subtitle);
 
         auto nameTitle = CCLabelBMFont::create("macro name", "goldFont.fnt");
-        nameTitle->setScale(.48f);
-        nameTitle->setPosition({180.f, 220.f});
+        nameTitle->setScale(.46f);
+        nameTitle->setPosition({180.f, 176.f});
         m_mainLayer->addChild(nameTitle);
 
         m_nameInput = TextInput::create(230.f, "macro name", "bigFont.fnt");
         m_nameInput->setString(g_pending.macroName, false);
-        m_nameInput->setPosition({180.f, 195.f});
+        m_nameInput->setPosition({180.f, 150.f});
         m_mainLayer->addChild(m_nameInput);
 
-        auto modeTitle = CCLabelBMFont::create("search mode", "goldFont.fnt");
-        modeTitle->setScale(.48f);
-        modeTitle->setPosition({180.f, 157.f});
-        m_mainLayer->addChild(modeTitle);
+        auto popTitle = CCLabelBMFont::create("generation size", "goldFont.fnt");
+        popTitle->setScale(.46f);
+        popTitle->setPosition({180.f, 111.f});
+        m_mainLayer->addChild(popTitle);
 
-        m_modeLabel = CCLabelBMFont::create("path", "bigFont.fnt");
-        m_modeLabel->setScale(.46f);
-        m_modeLabel->setPosition({180.f, 134.f});
-        m_mainLayer->addChild(m_modeLabel);
-        refreshMode();
+        m_candidatesLabel = CCLabelBMFont::create("100 real candidates", "bigFont.fnt");
+        m_candidatesLabel->setScale(.42f);
+        m_candidatesLabel->setPosition({180.f, 87.f});
+        m_mainLayer->addChild(m_candidatesLabel);
+        refreshCandidates();
 
-        auto modeSpr = ButtonSprite::create("switch mode", .58f);
-        auto modeBtn = CCMenuItemSpriteExtra::create(
-            modeSpr, this, menu_selector(OmniPathPopup::onSwitchMode)
+        auto minus = CCMenuItemSpriteExtra::create(
+            ButtonSprite::create("-10", .58f), this, menu_selector(OmniPathPopup::onMinus)
         );
-        modeBtn->setPosition({180.f, 108.f});
-        m_buttonMenu->addChild(modeBtn);
+        minus->setPosition({92.f, 84.f});
+        m_buttonMenu->addChild(minus);
 
-        auto batchTitle = CCLabelBMFont::create("batch", "goldFont.fnt");
-        batchTitle->setScale(.48f);
-        batchTitle->setPosition({180.f, 79.f});
-        m_mainLayer->addChild(batchTitle);
-
-        m_batchLabel = CCLabelBMFont::create("30 generations", "bigFont.fnt");
-        m_batchLabel->setScale(.40f);
-        m_batchLabel->setPosition({180.f, 58.f});
-        m_mainLayer->addChild(m_batchLabel);
-        refreshBatch();
-
-        auto minusSpr = ButtonSprite::create("-10", .58f);
-        auto minusBtn = CCMenuItemSpriteExtra::create(
-            minusSpr, this, menu_selector(OmniPathPopup::onBatchMinus)
+        auto plus = CCMenuItemSpriteExtra::create(
+            ButtonSprite::create("+10", .58f), this, menu_selector(OmniPathPopup::onPlus)
         );
-        minusBtn->setPosition({92.f, 57.f});
-        m_buttonMenu->addChild(minusBtn);
+        plus->setPosition({268.f, 84.f});
+        m_buttonMenu->addChild(plus);
 
-        auto plusSpr = ButtonSprite::create("+10", .58f);
-        auto plusBtn = CCMenuItemSpriteExtra::create(
-            plusSpr, this, menu_selector(OmniPathPopup::onBatchPlus)
+        auto hint = CCLabelBMFont::create("speed / touch lock / ghosts are in pause", "bigFont.fnt");
+        hint->setScale(.26f);
+        hint->setPosition({180.f, 53.f});
+        m_mainLayer->addChild(hint);
+
+        auto start = CCMenuItemSpriteExtra::create(
+            ButtonSprite::create("START FRONTIER", .62f), this, menu_selector(OmniPathPopup::onStart)
         );
-        plusBtn->setPosition({268.f, 57.f});
-        m_buttonMenu->addChild(plusBtn);
-
-        auto startSpr = ButtonSprite::create("START BATCH", .62f);
-        auto startBtn = CCMenuItemSpriteExtra::create(
-            startSpr, this, menu_selector(OmniPathPopup::onStart)
-        );
-        startBtn->setPosition({180.f, 25.f});
-        m_buttonMenu->addChild(startBtn);
-
+        start->setPosition({180.f, 25.f});
+        m_buttonMenu->addChild(start);
         return true;
     }
 
-    void onSwitchMode(CCObject*) {
-        switch (m_mode) {
-            case omnipath::SearchMode::Evolution:
-                m_mode = omnipath::SearchMode::GuidedMutation;
-                break;
-            case omnipath::SearchMode::GuidedMutation:
-                m_mode = omnipath::SearchMode::Path;
-                break;
-            case omnipath::SearchMode::Path:
-                m_mode = omnipath::SearchMode::Evolution;
-                break;
-        }
-        refreshMode();
+    void onMinus(CCObject*) {
+        if (m_candidates > 10) m_candidates -= 10;
+        refreshCandidates();
     }
 
-    void onBatchMinus(CCObject*) {
-        if (m_batchGenerations > 10) m_batchGenerations -= 10;
-        refreshBatch();
-    }
-
-    void onBatchPlus(CCObject*) {
-        if (m_batchGenerations < 100) m_batchGenerations += 10;
-        refreshBatch();
+    void onPlus(CCObject*) {
+        if (m_candidates < 100) m_candidates += 10;
+        refreshCandidates();
     }
 
     void onStart(CCObject*) {
         if (!m_owner || !m_owner->m_level) return;
         g_pending.armed = true;
         g_pending.macroName = sanitizeName(std::string(m_nameInput->getString()));
-        g_pending.mode = m_mode;
-        g_pending.batchGenerations = m_batchGenerations;
+        g_pending.candidates = m_candidates;
         this->onClose(nullptr);
         m_owner->onPlay(nullptr);
     }
@@ -342,6 +514,14 @@ public:
 
 } // namespace
 
+class $modify(OmniPathBaseGameLayer, GJBaseGameLayer) {
+    void handleButton(bool down, int button, bool isPlayer1) {
+        if (g_live.active && g_live.ignoreTouch && !g_live.injectingInput && button == 1)
+            return;
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+    }
+};
+
 class $modify(OmniPathLevelInfoLayer, LevelInfoLayer) {
     bool init(GJGameLevel* level, bool challenge) {
         if (!LevelInfoLayer::init(level, challenge)) return false;
@@ -351,7 +531,6 @@ class $modify(OmniPathLevelInfoLayer, LevelInfoLayer) {
             spr, this, menu_selector(OmniPathLevelInfoLayer::onOmniPath)
         );
         btn->setID("omnipath-button");
-
         if (m_playBtnMenu) {
             btn->setPosition({68.f, 0.f});
             m_playBtnMenu->addChild(btn);
@@ -360,76 +539,143 @@ class $modify(OmniPathLevelInfoLayer, LevelInfoLayer) {
     }
 
     void onOmniPath(CCObject*) {
-        auto popup = OmniPathPopup::create(this);
-        popup->show();
+        OmniPathPopup::create(this)->show();
+    }
+};
+
+class $modify(OmniPathPauseLayer, PauseLayer) {
+    void customSetup() {
+        PauseLayer::customSetup();
+        if (!g_live.active) return;
+
+        auto win = CCDirector::sharedDirector()->getWinSize();
+        auto menu = CCMenu::create();
+        menu->setPosition({0.f, 0.f});
+        menu->setID("omnipath-pause-menu");
+        addChild(menu, 10000);
+
+        auto title = CCLabelBMFont::create("OmniPath", "goldFont.fnt");
+        title->setScale(.42f);
+        title->setPosition({win.width * .5f, 54.f});
+        addChild(title, 10000);
+
+        auto speedText = std::string("speed x") + std::to_string(g_live.trainingSpeed);
+        auto speed = CCMenuItemSpriteExtra::create(
+            ButtonSprite::create(speedText.c_str(), .48f),
+            this,
+            menu_selector(OmniPathPauseLayer::onSpeed)
+        );
+        speed->setPosition({win.width * .5f - 105.f, 28.f});
+        menu->addChild(speed);
+
+        auto touch = CCMenuItemSpriteExtra::create(
+            ButtonSprite::create(g_live.ignoreTouch ? "touch LOCK" : "touch ON", .48f),
+            this,
+            menu_selector(OmniPathPauseLayer::onTouch)
+        );
+        touch->setPosition({win.width * .5f, 28.f});
+        menu->addChild(touch);
+
+        auto ghosts = CCMenuItemSpriteExtra::create(
+            ButtonSprite::create(g_live.ghosts ? "ghosts ON" : "ghosts OFF", .48f),
+            this,
+            menu_selector(OmniPathPauseLayer::onGhosts)
+        );
+        ghosts->setPosition({win.width * .5f + 105.f, 28.f});
+        menu->addChild(ghosts);
+    }
+
+    void updateButton(CCObject* sender, std::string const& text) {
+        auto item = static_cast<CCMenuItemSpriteExtra*>(sender);
+        if (!item) return;
+        auto spr = static_cast<ButtonSprite*>(item->getNormalImage());
+        if (!spr) return;
+        spr->setString(text.c_str());
+        item->updateSprite();
+    }
+
+    void onSpeed(CCObject* sender) {
+        switch (g_live.trainingSpeed) {
+            case 1: g_live.trainingSpeed = 2; break;
+            case 2: g_live.trainingSpeed = 4; break;
+            case 4: g_live.trainingSpeed = 8; break;
+            default: g_live.trainingSpeed = 1; break;
+        }
+        updateButton(sender, std::string("speed x") + std::to_string(g_live.trainingSpeed));
+    }
+
+    void onTouch(CCObject* sender) {
+        g_live.ignoreTouch = !g_live.ignoreTouch;
+        updateButton(sender, g_live.ignoreTouch ? "touch LOCK" : "touch ON");
+    }
+
+    void onGhosts(CCObject* sender) {
+        g_live.ghosts = !g_live.ghosts;
+        if (!g_live.ghosts && g_live.ghostDraw) g_live.ghostDraw->clear();
+        updateButton(sender, g_live.ghosts ? "ghosts ON" : "ghosts OFF");
     }
 };
 
 class $modify(OmniPathPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-
         if (!g_pending.armed) return true;
         g_pending.armed = false;
 
         if (m_isPlatformer) {
-            FLAlertLayer::create(
-                "OmniPath",
-                "Platformer mode is not supported",
-                "OK"
-            )->show();
+            FLAlertLayer::create("OmniPath", "Platformer mode is not supported", "OK")->show();
             return true;
         }
 
         omnipath::SolverConfig cfg;
-        cfg.genomeLength = 12000;
-        cfg.decisionEveryTicks = g_pending.decisionTicks;
-        cfg.mode = g_pending.mode;
-
-        // The three modes intentionally use different search pressure. This is
-        // not just three names pointing at the same mutation loop anymore.
-        switch (cfg.mode) {
-            case omnipath::SearchMode::Evolution:
-                cfg.population = 32;
-                cfg.eliteCount = 6;
-                cfg.mutationRate = 0.014;
-                cfg.burstMutationRate = 0.45;
-                break;
-            case omnipath::SearchMode::GuidedMutation:
-                cfg.population = 20;
-                cfg.eliteCount = 4;
-                cfg.mutationRate = 0.007;
-                cfg.burstMutationRate = 0.30;
-                break;
-            case omnipath::SearchMode::Path:
-                cfg.population = 16;
-                cfg.eliteCount = 3;
-                cfg.mutationRate = 0.004;
-                cfg.burstMutationRate = 0.20;
-                break;
-        }
+        cfg.population = g_pending.candidates;
+        cfg.eliteCount = std::max<std::size_t>(3, cfg.population / 8);
+        cfg.genomeLength = 18000;
+        cfg.decisionEveryTicks = 1;
+        cfg.frontierMarginTicks = 90;
 
         g_live = {};
         g_live.active = true;
+        g_live.ignoreTouch = true;
+        g_live.ghosts = true;
+        g_live.trainingSpeed = 4;
+        g_live.appliedSpeed = 1;
         g_live.macroName = g_pending.macroName;
-        g_live.mode = g_pending.mode;
-        g_live.batchGenerations = g_pending.batchGenerations;
-        g_live.solver = std::make_unique<omnipath::EvolutionSolver>(cfg);
+        g_live.maxGenerations = g_pending.maxGenerations;
+        g_live.solver = std::make_unique<omnipath::FrontierPlanner>(cfg);
+        g_live.trails.resize(cfg.population);
+
+        if (m_objects) {
+            g_live.scanObjects.reserve(m_objects->count());
+            for (auto obj : geode::cocos::CCArrayExt<GameObject, false>(m_objects)) {
+                if (!obj) continue;
+                auto type = obj->getType();
+                if (isObstacle(type) || isInteractable(type))
+                    g_live.scanObjects.push_back(obj);
+            }
+        }
+
+        auto scheduler = CCDirector::sharedDirector()->getScheduler();
+        g_live.baseTimeScale = scheduler ? scheduler->getTimeScale() : 1.0f;
 
         if (m_player1) {
             g_live.lastX = m_player1->getPositionX();
             g_live.lastY = m_player1->getPositionY();
+            g_live.maxX = g_live.lastX;
         }
 
+        releaseInputs(this);
         createHud(this);
-        updateHud(this);
+        auto observation = observeWorld(this);
+        updateHud(this, &observation);
+        setSpeedMultiplier(g_live.trainingSpeed);
 
         log::info(
-            "OmniPath started: name={}, mode={}, batch={}, population={}",
+            "OmniPath FRONTIER started: name={}, candidates={}, maxGenerations={}, speed=x{}",
             g_live.macroName,
-            omnipath::modeName(cfg.mode),
-            g_live.batchGenerations,
-            cfg.population
+            cfg.population,
+            g_live.maxGenerations,
+            g_live.trainingSpeed
         );
         return true;
     }
@@ -441,101 +687,124 @@ class $modify(OmniPathPlayLayer, PlayLayer) {
         if (m_player1) {
             g_live.lastX = m_player1->getPositionX();
             g_live.lastY = m_player1->getPositionY();
+            g_live.maxX = std::max(g_live.maxX, g_live.lastX);
         }
 
-        if ((g_live.tick % 5) == 0)
-            updateHud(this);
+        auto observation = observeWorld(this);
+
+        int effective = g_live.trainingSpeed;
+        if (g_live.solver->hasBest()) {
+            auto frontier = g_live.solver->frontierTick();
+            if (g_live.tick + 220 >= frontier) effective = std::min(effective, 2);
+        }
+        if (observation.p1.hazardAhead && observation.p1.nearestHazardDx < 100.0f)
+            effective = 1;
+        if (observation.p1.mode == omnipath::PlayerMode::Wave && observation.p1.hasTarget)
+            effective = std::min(effective, 2);
+        setSpeedMultiplier(effective);
+
+        if ((g_live.tick % 7) == 0 && m_player1) {
+            if (g_live.currentTrail.size() < 72)
+                g_live.currentTrail.push_back(m_player1->getPosition());
+        }
+        if ((g_live.tick % 21) == 0) redrawGhosts();
+        if ((g_live.tick % 5) == 0) updateHud(this, &observation);
 
         if (getCurrentPercent() >= 99.999f) {
+            auto oldIndex = g_live.solver->currentIndex();
+            if (oldIndex < g_live.trails.size()) g_live.trails[oldIndex] = g_live.currentTrail;
+
             omnipath::AttemptResult result;
             result.progress = 100.0f;
-            result.survivedTicks = g_live.tick;
+            result.maxX = g_live.maxX;
             result.deathX = g_live.lastX;
             result.deathY = g_live.lastY;
+            result.survivedTicks = g_live.tick;
+            result.deathMode = observation.p1.mode;
             result.died = false;
             g_live.solver->submit(result);
 
-            saveBestMacro(true);
-            releaseInputs(this);
-            g_live.active = false;
-            updateHud(this, true);
-            Notification::create(
-                "OmniPath: SOLVED - macro saved",
-                static_cast<CCNode*>(nullptr),
-                3.0f
-            )->show();
+            endTraining(this, "OmniPath: SOLVED - macro saved");
+            redrawGhosts();
             return;
         }
 
         if (m_playerDied) {
             ++g_live.deadTicks;
-            if (g_live.deadTicks >= 2)
-                this->resetLevel();
+            if (g_live.deadTicks >= 2) this->resetLevel();
             return;
         }
 
         g_live.deadTicks = 0;
-        applyGene(this, g_live.solver->geneForTick(g_live.tick));
+        auto gene = g_live.solver->decide(g_live.tick, observation);
+        applyGene(this, gene);
         ++g_live.tick;
     }
 
     void resetLevel() {
-        bool finishedBatch = false;
+        bool finished = false;
 
         if (g_live.active && g_live.solver && g_live.tick > 0) {
+            auto candidateIndex = g_live.solver->currentIndex();
+            auto generationBefore = g_live.solver->generation();
             auto oldBest = g_live.solver->hasBest() ? g_live.solver->best().progress : -1.0f;
+            auto progress = getCurrentPercent();
+
+            if (candidateIndex < g_live.trails.size())
+                g_live.trails[candidateIndex] = g_live.currentTrail;
+            if (progress >= g_live.leaderProgress) {
+                g_live.leaderProgress = progress;
+                g_live.leaderIndex = candidateIndex;
+            }
 
             omnipath::AttemptResult result;
-            result.progress = getCurrentPercent();
-            result.survivedTicks = g_live.tick;
+            result.progress = progress;
+            result.maxX = g_live.maxX;
             result.deathX = g_live.lastX;
             result.deathY = g_live.lastY;
+            result.survivedTicks = g_live.tick;
+            result.deathMode = playerMode(m_player1);
             result.died = m_playerDied;
             g_live.solver->submit(result);
 
             auto newBest = g_live.solver->hasBest() ? g_live.solver->best().progress : -1.0f;
-            if (newBest > oldBest + 0.001f)
-                saveBestMacro(false);
+            if (newBest > oldBest + 0.001f) saveBestMacro(false);
 
-            log::debug(
-                "OmniPath mode={} gen={} candidate={} progress={} best={} deaths={}",
-                omnipath::modeName(g_live.mode),
-                g_live.solver->generation(),
-                g_live.solver->currentIndex(),
-                result.progress,
-                newBest,
-                g_live.solver->deathMap().size()
-            );
-
-            if (g_live.solver->generation() >= g_live.batchGenerations) {
-                finishedBatch = true;
-                saveBestMacro(true);
-                releaseInputs(this);
-                g_live.active = false;
-                updateHud(this, true);
-                Notification::create(
-                    "OmniPath: batch complete - best macro saved",
-                    static_cast<CCNode*>(nullptr),
-                    3.0f
-                )->show();
+            auto generationAfter = g_live.solver->generation();
+            bool generationClosed = generationAfter != generationBefore;
+            if (generationClosed) {
+                log::info(
+                    "OmniPath generation {} complete: leader={} best={} frontier={} stuck={}",
+                    generationBefore + 1,
+                    g_live.leaderIndex + 1,
+                    newBest,
+                    g_live.solver->frontierTick(),
+                    g_live.solver->stagnantGenerations()
+                );
+                if (generationAfter >= g_live.maxGenerations) finished = true;
             }
         }
 
         releaseInputs(this);
         g_live.tick = 0;
         g_live.deadTicks = 0;
+        g_live.maxX = 0.0f;
+        g_live.currentTrail.clear();
         PlayLayer::resetLevel();
 
-        if (finishedBatch) {
-            // Keep the final HUD visible after reset so the 10-100 generation
-            // batch result can be inspected before leaving the level.
-            updateHud(this, true);
+        if (m_player1) g_live.maxX = m_player1->getPositionX();
+        redrawGhosts();
+
+        if (finished) {
+            endTraining(this, "OmniPath: generation limit reached - best macro saved");
         }
     }
 
     void onQuit() {
         if (g_live.active) {
             saveBestMacro(true);
+            releaseInputs(this);
+            restoreTimeScale();
             g_live.active = false;
         }
         PlayLayer::onQuit();
