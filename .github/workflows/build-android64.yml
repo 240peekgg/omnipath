@@ -1,0 +1,30 @@
+name: Build Android64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'mod.json'
+      - 'CMakeLists.txt'
+      - '.github/workflows/build-android64.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build Android64 Geode mod
+        id: build
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          target: Android64
+          sdk: latest
+
+      - name: Upload Android64 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: OmniPath-Android64
+          path: ${{ steps.build.outputs.build-output }}
