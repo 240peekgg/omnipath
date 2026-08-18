@@ -10,6 +10,9 @@ on:
       - 'CMakeLists.txt'
       - '.github/workflows/build-android64.yml'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -28,3 +31,23 @@ jobs:
         with:
           name: OmniPath-Android64
           path: ${{ steps.build.outputs.build-output }}
+
+      - name: Publish .geode into repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          FILE="${{ steps.build.outputs.build-output }}"
+          if [ -f "$FILE" ]; then
+            cp "$FILE" dist/OmniPath-Android64.geode
+          else
+            FOUND="$(find . -type f -name '*.geode' | head -n 1)"
+            test -n "$FOUND"
+            cp "$FOUND" dist/OmniPath-Android64.geode
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dist/OmniPath-Android64.geode
+          git diff --cached --quiet && exit 0
+          git commit -m "publish Android64 build [skip ci]"
+          git push
