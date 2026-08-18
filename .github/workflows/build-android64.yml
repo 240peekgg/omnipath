@@ -3,6 +3,13 @@ name: Build Android64
 on:
   workflow_dispatch:
   push:
+    branches: [main, v0.3-frontier-planner]
+    paths:
+      - 'src/**'
+      - 'mod.json'
+      - 'CMakeLists.txt'
+      - '.github/workflows/build-android64.yml'
+  pull_request:
     branches: [main]
     paths:
       - 'src/**'
@@ -33,6 +40,7 @@ jobs:
           path: ${{ steps.build.outputs.build-output }}
 
       - name: Publish .geode into repository
+        if: github.event_name == 'push'
         shell: bash
         run: |
           set -euo pipefail

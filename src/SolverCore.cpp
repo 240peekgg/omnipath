@@ -2,232 +2,361 @@
 
 #include <chrono>
 #include <cmath>
-#include <limits>
-#include <stdexcept>
 
 namespace omnipath {
 
 namespace {
 
-std::size_t clampIndex(long long value, std::size_t size) {
-    if (size == 0) return 0;
-    if (value < 0) return 0;
-    auto v = static_cast<std::size_t>(value);
-    return std::min(v, size - 1);
+template <class T>
+T clampValue(T v, T lo, T hi) {
+    return std::max(lo, std::min(v, hi));
+}
+
+float normalizedLane(std::size_t index, std::size_t modulo) {
+    if (modulo <= 1) return 0.0f;
+    auto v = static_cast<float>(index % modulo) / static_cast<float>(modulo - 1);
+    return v * 2.0f - 1.0f;
 }
 
 } // namespace
 
-const char* modeName(SearchMode mode) {
+const char* modeName(PlayerMode mode) {
     switch (mode) {
-        case SearchMode::Evolution: return "evolution";
-        case SearchMode::GuidedMutation: return "guided";
-        case SearchMode::Path: return "path";
+        case PlayerMode::Cube: return "cube";
+        case PlayerMode::Ship: return "ship";
+        case PlayerMode::Ball: return "ball";
+        case PlayerMode::Ufo: return "ufo";
+        case PlayerMode::Wave: return "wave";
+        case PlayerMode::Robot: return "robot";
+        case PlayerMode::Spider: return "spider";
+        case PlayerMode::Swing: return "swing";
+        case PlayerMode::Unknown: return "unknown";
     }
     return "unknown";
 }
 
-EvolutionSolver::EvolutionSolver(SolverConfig config) : m_cfg(config) {
-    if (m_cfg.population < 10) m_cfg.population = 10;
-    if (m_cfg.population > 100) m_cfg.population = 100;
-    if (m_cfg.eliteCount < 2) m_cfg.eliteCount = 2;
-    if (m_cfg.eliteCount >= m_cfg.population) m_cfg.eliteCount = m_cfg.population - 1;
-    if (m_cfg.genomeLength < 256) m_cfg.genomeLength = 256;
-    if (m_cfg.decisionEveryTicks < 1) m_cfg.decisionEveryTicks = 1;
+FrontierPlanner::FrontierPlanner(SolverConfig config) : m_cfg(config) {
+    m_cfg.population = clampValue<std::size_t>(m_cfg.population, 10, 100);
+    m_cfg.eliteCount = clampValue<std::size_t>(m_cfg.eliteCount, 2, std::max<std::size_t>(2, m_cfg.population - 1));
+    m_cfg.genomeLength = std::max<std::size_t>(m_cfg.genomeLength, 1024);
+    m_cfg.decisionEveryTicks = std::max<std::uint32_t>(m_cfg.decisionEveryTicks, 1);
     reset();
 }
 
-void EvolutionSolver::reset(std::uint64_t seed) {
+void FrontierPlanner::reset(std::uint64_t seed) {
     if (!seed) {
         seed = static_cast<std::uint64_t>(
             std::chrono::high_resolution_clock::now().time_since_epoch().count()
         );
     }
     m_rng.seed(seed);
-    m_generation = 0;
-    m_index = 0;
-    m_hasBest = false;
+    m_population.clear();
     m_best = {};
+    m_hasBest = false;
+    m_index = 0;
+    m_generation = 0;
     m_stagnantGenerations = 0;
-    m_previousGenerationBest = 0.0f;
-    m_childSerial = 0;
-    m_deathMap.clear();
+    m_generationLeaderProgress = 0.0f;
+    m_generationLeaderIndex = 0;
+    m_frontierTick = 0;
     m_generationHistory.clear();
+    resetRuntime();
     initializePopulation();
 }
 
-void EvolutionSolver::initializePopulation() {
-    m_population.assign(m_cfg.population, {});
+void FrontierPlanner::resetRuntime() {
+    m_runtime1 = {};
+    m_runtime2 = {};
+}
 
-    for (std::size_t n = 0; n < m_population.size(); ++n) {
-        auto& candidate = m_population[n];
-        candidate.genes.resize(m_cfg.genomeLength);
+PolicyParams FrontierPlanner::seededPolicy(std::size_t i) const {
+    PolicyParams p;
+    auto lane5 = normalizedLane(i, 5);
+    auto lane7 = normalizedLane(i / 5, 7);
+    auto lane4 = normalizedLane(i / 35, 4);
 
-        // Candidate zero is a pure no-input probe. It gives PATH mode a clean
-        // first death point instead of starting with meaningless random spam.
-        if (n == 0) {
-            continue;
+    p.hazardLead = 70.0f + (lane5 + 1.0f) * 28.0f;
+    p.orbLead = 28.0f + (lane7 + 1.0f) * 12.0f;
+    p.cubeTapTicks = static_cast<std::uint16_t>(1 + (i % 4));
+    p.robotHoldTicks = static_cast<std::uint16_t>(5 + ((i / 4) % 8) * 2);
+    p.ufoCooldown = static_cast<std::uint16_t>(7 + (i % 7));
+    p.toggleCooldown = static_cast<std::uint16_t>(6 + ((i / 7) % 8));
+    p.shipDwell = static_cast<std::uint16_t>(2 + (i % 4));
+    p.waveDwell = static_cast<std::uint16_t>(1 + (i % 3));
+    p.targetBias = lane7 * 34.0f;
+    p.verticalGain = 0.045f + (lane5 + 1.0f) * 0.015f;
+    p.velocityGain = 0.45f + (lane7 + 1.0f) * 0.22f;
+    p.hysteresis = 4.0f + (lane4 + 1.0f) * 5.0f;
+    p.frontierJitter = lane5 * 20.0f;
+    return p;
+}
+
+void FrontierPlanner::initializePopulation() {
+    m_population.resize(m_cfg.population);
+    for (std::size_t i = 0; i < m_population.size(); ++i) {
+        auto& c = m_population[i];
+        c.policy = seededPolicy(i);
+        c.genes.assign(m_cfg.genomeLength, {});
+    }
+}
+
+bool FrontierPlanner::decidePlayer(
+    std::uint32_t tick,
+    PlayerObservation const& o,
+    PolicyParams const& p,
+    PlayerRuntime& rt,
+    bool inheritedHeld
+) {
+    if (!o.active) return false;
+
+    if (tick < m_frontierTick && m_hasBest) {
+        rt.held = inheritedHeld;
+        rt.lastChangeTick = tick;
+        return inheritedHeld;
+    }
+
+    if (o.dashing) return rt.held;
+
+    auto setHeld = [&](bool desired, std::uint32_t dwell) {
+        if (desired != rt.held && tick >= rt.lastChangeTick + dwell) {
+            rt.held = desired;
+            rt.lastChangeTick = tick;
+        }
+        return rt.held;
+    };
+
+    auto pulse = [&](std::uint32_t holdTicks, std::uint32_t cooldown) {
+        if (rt.held && tick >= rt.heldUntil) {
+            rt.held = false;
+            rt.lastChangeTick = tick;
+        }
+        if (!rt.held && tick >= rt.cooldownUntil) {
+            rt.held = true;
+            rt.heldUntil = tick + std::max<std::uint32_t>(1, holdTicks);
+            rt.cooldownUntil = tick + std::max<std::uint32_t>(2, cooldown);
+            rt.lastChangeTick = tick;
+        }
+        return rt.held;
+    };
+
+    if (o.touchingRing || (o.interactableAhead && o.nearestInteractableDx <= p.orbLead)) {
+        if (tick >= rt.cooldownUntil)
+            return pulse(1, 5);
+    }
+
+    float target = o.hasTarget ? (o.targetY + p.targetBias) : o.y;
+    float error = target - o.y;
+    float control = error * p.verticalGain - static_cast<float>(o.yVelocity) * p.velocityGain;
+    if (o.upsideDown) control = -control;
+
+    float lead = p.hazardLead + p.frontierJitter;
+    bool hazardSoon = o.hazardAhead && o.nearestHazardDx <= lead;
+
+    switch (o.mode) {
+        case PlayerMode::Cube: {
+            if (rt.held && tick >= rt.heldUntil) {
+                rt.held = false;
+                rt.lastChangeTick = tick;
+            }
+            if (o.onGround && hazardSoon && tick >= rt.cooldownUntil) {
+                rt.held = true;
+                rt.heldUntil = tick + p.cubeTapTicks;
+                rt.cooldownUntil = tick + 8;
+                rt.lastChangeTick = tick;
+            }
+            return rt.held;
         }
 
-        // Several deterministic tap/hold rhythms make the first generation
-        // dramatically less stupid on basic cube gameplay. They also serve as
-        // useful seeds for robot, UFO and simple ship sections.
-        if (n < 10) {
-            const std::size_t period = 30 + n * 7;
-            const std::size_t hold = 4 + (n % 4) * 3;
-            const std::size_t offset = 7 + n * 3;
-            for (std::size_t i = 0; i < candidate.genes.size(); ++i) {
-                auto phase = (i + period - (offset % period)) % period;
-                candidate.genes[i].p1 = phase < hold;
-                candidate.genes[i].p2 = false;
+        case PlayerMode::Robot: {
+            if (rt.held && tick >= rt.heldUntil) {
+                rt.held = false;
+                rt.lastChangeTick = tick;
             }
-            continue;
+            if (o.onGround && hazardSoon && tick >= rt.cooldownUntil) {
+                rt.held = true;
+                auto extra = static_cast<int>(std::max(0.0f, o.nearestHazardDy) / 18.0f);
+                rt.heldUntil = tick + clampValue<std::uint32_t>(p.robotHoldTicks + extra, 4, 28);
+                rt.cooldownUntil = tick + 10;
+                rt.lastChangeTick = tick;
+            }
+            return rt.held;
         }
 
-        // The rest are random, but piecewise-constant instead of per-frame
-        // noise. This produces actual taps and holds that GD can use.
-        std::bernoulli_distribution startHeld(0.08);
-        std::bernoulli_distribution toggleP1(0.028);
-        std::bernoulli_distribution toggleP2(0.009);
-        bool p1 = startHeld(m_rng);
-        bool p2 = false;
-        std::size_t dwell1 = 0;
-        std::size_t dwell2 = 0;
+        case PlayerMode::Ship: {
+            bool desired = control > p.hysteresis * 0.01f;
+            return setHeld(desired, p.shipDwell);
+        }
 
-        for (std::size_t i = 0; i < candidate.genes.size(); ++i) {
-            if (dwell1 >= 3 && toggleP1(m_rng)) {
-                p1 = !p1;
-                dwell1 = 0;
+        case PlayerMode::Wave: {
+            float threshold = std::max(2.0f, p.hysteresis * 0.55f);
+            bool desired = o.upsideDown ? (error < -threshold) : (error > threshold);
+            return setHeld(desired, p.waveDwell);
+        }
+
+        case PlayerMode::Ufo: {
+            if (rt.held && tick >= rt.heldUntil) {
+                rt.held = false;
+                rt.lastChangeTick = tick;
             }
-            if (dwell2 >= 8 && toggleP2(m_rng)) {
-                p2 = !p2;
-                dwell2 = 0;
+            bool needLift = o.upsideDown ? (error < -p.hysteresis) : (error > p.hysteresis);
+            if (needLift && tick >= rt.cooldownUntil)
+                return pulse(1, p.ufoCooldown);
+            return rt.held;
+        }
+
+        case PlayerMode::Ball:
+        case PlayerMode::Spider:
+        case PlayerMode::Swing: {
+            if (rt.held && tick >= rt.heldUntil) {
+                rt.held = false;
+                rt.lastChangeTick = tick;
             }
-            candidate.genes[i] = {p1, p2};
-            ++dwell1;
-            ++dwell2;
+            bool needSwitch = std::abs(error) > std::max(12.0f, p.hysteresis * 2.0f);
+            if ((needSwitch || hazardSoon) && tick >= rt.cooldownUntil)
+                return pulse(1, p.toggleCooldown);
+            return rt.held;
+        }
+
+        case PlayerMode::Unknown:
+        default: {
+            if (rt.held && tick >= rt.heldUntil) rt.held = false;
+            if (o.onGround && hazardSoon && tick >= rt.cooldownUntil)
+                return pulse(2, 8);
+            return rt.held;
         }
     }
 }
 
-void EvolutionSolver::clearScore(Candidate& candidate) const {
-    candidate.fitness = -1.0;
-    candidate.progress = 0.0f;
-    candidate.survivedTicks = 0;
-    candidate.toggles = 0;
+Gene FrontierPlanner::decide(std::uint32_t tick, Observation const& obs) {
+    auto& c = m_population.at(m_index);
+    auto geneIndex = static_cast<std::size_t>(tick / m_cfg.decisionEveryTicks);
+    if (geneIndex >= c.genes.size()) geneIndex = c.genes.size() - 1;
+
+    Gene inherited{};
+    if (m_hasBest && geneIndex < m_best.genes.size()) inherited = m_best.genes[geneIndex];
+
+    Gene out;
+    out.p1 = decidePlayer(tick, obs.p1, c.policy, m_runtime1, inherited.p1);
+    out.p2 = obs.dual
+        ? decidePlayer(tick, obs.p2, c.policy, m_runtime2, inherited.p2)
+        : false;
+
+    c.genes[geneIndex] = out;
+    return out;
 }
 
-std::uint32_t EvolutionSolver::countToggles(Candidate const& candidate) const {
-    bool p1 = false;
-    bool p2 = false;
+std::uint32_t FrontierPlanner::countToggles(Candidate const& c) const {
+    Gene prev{};
     std::uint32_t toggles = 0;
-    for (auto const& g : candidate.genes) {
-        if (g.p1 != p1) ++toggles;
-        if (g.p2 != p2) ++toggles;
-        p1 = g.p1;
-        p2 = g.p2;
+    for (auto const& g : c.genes) {
+        if (g.p1 != prev.p1) ++toggles;
+        if (g.p2 != prev.p2) ++toggles;
+        prev = g;
     }
     return toggles;
 }
 
-double EvolutionSolver::score(
-    float progressPercent,
-    std::uint32_t survivedTicks,
-    std::uint32_t toggles
-) const {
-    const double p = std::clamp<double>(progressPercent, 0.0, 100.0);
-
-    // Progress wins by a huge margin. Survival breaks ties, while input spam
-    // gets a tiny penalty so two equally successful routes prefer the cleaner
-    // macro instead of 500 useless clicks.
-    return p * p * 3000.0
-        + static_cast<double>(survivedTicks) * 4.0
-        - static_cast<double>(toggles) * 0.20;
+double FrontierPlanner::score(AttemptResult const& r, std::uint32_t toggles) const {
+    double p = clampValue<double>(r.progress, 0.0, 100.0);
+    return p * p * 100000.0
+        + static_cast<double>(r.maxX) * 180.0
+        + static_cast<double>(r.survivedTicks) * 2.0
+        - static_cast<double>(toggles) * 3.0;
 }
 
-void EvolutionSolver::recordDeath(AttemptResult const& result) {
-    if (!result.died || m_population.empty() || m_index >= m_population.size()) return;
+PolicyParams FrontierPlanner::mutatePolicy(PolicyParams const& parent, std::size_t childIndex) {
+    PolicyParams p = parent;
+    double spread = 1.0 + std::min<std::size_t>(m_stagnantGenerations, 8) * 0.22;
+    std::normal_distribution<double> n(0.0, spread);
+    float lane = normalizedLane(childIndex, 11);
 
-    auto const& candidate = m_population[m_index];
-    if (candidate.genes.empty()) return;
+    p.hazardLead = clampValue<float>(p.hazardLead + static_cast<float>(n(m_rng) * 7.0) + lane * 8.0f, 35.0f, 190.0f);
+    p.orbLead = clampValue<float>(p.orbLead + static_cast<float>(n(m_rng) * 3.5), 16.0f, 80.0f);
+    p.cubeTapTicks = clampValue<std::uint16_t>(static_cast<std::uint16_t>(std::max<int>(1, static_cast<int>(p.cubeTapTicks) + static_cast<int>(std::round(n(m_rng))))), 1, 8);
+    p.robotHoldTicks = clampValue<std::uint16_t>(static_cast<std::uint16_t>(std::max<int>(2, static_cast<int>(p.robotHoldTicks) + static_cast<int>(std::round(n(m_rng) * 2.0)))), 3, 34);
+    p.ufoCooldown = clampValue<std::uint16_t>(static_cast<std::uint16_t>(std::max<int>(3, static_cast<int>(p.ufoCooldown) + static_cast<int>(std::round(n(m_rng))))), 4, 24);
+    p.toggleCooldown = clampValue<std::uint16_t>(static_cast<std::uint16_t>(std::max<int>(3, static_cast<int>(p.toggleCooldown) + static_cast<int>(std::round(n(m_rng))))), 4, 24);
+    p.shipDwell = clampValue<std::uint16_t>(static_cast<std::uint16_t>(std::max<int>(1, static_cast<int>(p.shipDwell) + static_cast<int>(std::round(n(m_rng) * 0.5)))), 1, 8);
+    p.waveDwell = clampValue<std::uint16_t>(static_cast<std::uint16_t>(std::max<int>(1, static_cast<int>(p.waveDwell) + static_cast<int>(std::round(n(m_rng) * 0.35)))), 1, 5);
+    p.targetBias = clampValue<float>(p.targetBias + static_cast<float>(n(m_rng) * 7.0) + lane * 4.0f, -90.0f, 90.0f);
+    p.verticalGain = clampValue<float>(p.verticalGain + static_cast<float>(n(m_rng) * 0.006), 0.015f, 0.14f);
+    p.velocityGain = clampValue<float>(p.velocityGain + static_cast<float>(n(m_rng) * 0.08), 0.10f, 1.75f);
+    p.hysteresis = clampValue<float>(p.hysteresis + static_cast<float>(n(m_rng) * 1.8), 2.0f, 32.0f);
+    p.frontierJitter = clampValue<float>(static_cast<float>(n(m_rng) * 16.0) + lane * 14.0f, -45.0f, 45.0f);
+    return p;
+}
 
-    auto geneIndex = std::min<std::size_t>(
-        result.survivedTicks / m_cfg.decisionEveryTicks,
-        candidate.genes.size() - 1
-    );
-    bool wasHeld = candidate.genes[geneIndex].p1;
+void FrontierPlanner::breedNextGeneration() {
+    std::sort(m_population.begin(), m_population.end(), [](Candidate const& a, Candidate const& b) {
+        return a.fitness > b.fitness;
+    });
 
-    DeathCluster* match = nullptr;
-    float bestDistance = std::numeric_limits<float>::max();
+    std::vector<Candidate> next;
+    next.reserve(m_cfg.population);
 
-    for (auto& cluster : m_deathMap) {
-        float dx = std::abs(cluster.x - result.deathX);
-        float dp = std::abs(cluster.progress - result.progress);
-        if (dx <= 72.0f && dp <= 1.75f) {
-            float d = dx + dp * 24.0f;
-            if (d < bestDistance) {
-                bestDistance = d;
-                match = &cluster;
-            }
+    if (m_hasBest) {
+        Candidate champion;
+        champion.policy = m_best.policy;
+        champion.genes.assign(m_cfg.genomeLength, {});
+        auto prefixGenes = std::min<std::size_t>(m_frontierTick / m_cfg.decisionEveryTicks, m_best.genes.size());
+        std::copy_n(m_best.genes.begin(), prefixGenes, champion.genes.begin());
+        next.push_back(std::move(champion));
+    }
+
+    std::size_t elites = std::min(m_cfg.eliteCount, m_population.size());
+    for (std::size_t i = 0; i < elites && next.size() < m_cfg.population; ++i) {
+        Candidate c;
+        c.policy = m_population[i].policy;
+        c.genes.assign(m_cfg.genomeLength, {});
+        if (m_hasBest) {
+            auto prefixGenes = std::min<std::size_t>(m_frontierTick / m_cfg.decisionEveryTicks, m_best.genes.size());
+            std::copy_n(m_best.genes.begin(), prefixGenes, c.genes.begin());
         }
+        next.push_back(std::move(c));
     }
 
-    if (!match) {
-        DeathCluster cluster;
-        cluster.x = result.deathX;
-        cluster.y = result.deathY;
-        cluster.progress = result.progress;
-        cluster.tick = result.survivedTicks;
-        cluster.hits = 1;
-        cluster.actionBias = wasHeld ? -1 : 1;
-        cluster.recommendedHold = cluster.actionBias >= 0;
-        cluster.confidence = 1.0f;
-        m_deathMap.push_back(cluster);
-        return;
+    std::uniform_int_distribution<std::size_t> choose(0, elites - 1);
+    while (next.size() < m_cfg.population) {
+        auto parentIndex = choose(m_rng);
+        Candidate c;
+        c.policy = mutatePolicy(m_population[parentIndex].policy, next.size());
+        c.genes.assign(m_cfg.genomeLength, {});
+        if (m_hasBest) {
+            auto prefixGenes = std::min<std::size_t>(m_frontierTick / m_cfg.decisionEveryTicks, m_best.genes.size());
+            std::copy_n(m_best.genes.begin(), prefixGenes, c.genes.begin());
+        }
+        next.push_back(std::move(c));
     }
 
-    auto oldHits = match->hits;
-    auto newHits = oldHits + 1;
-    auto blend = [oldHits, newHits](float oldValue, float newValue) {
-        return (oldValue * static_cast<float>(oldHits) + newValue)
-            / static_cast<float>(newHits);
-    };
-
-    match->x = blend(match->x, result.deathX);
-    match->y = blend(match->y, result.deathY);
-    match->progress = blend(match->progress, result.progress);
-    match->tick = static_cast<std::uint32_t>(
-        (static_cast<std::uint64_t>(match->tick) * oldHits + result.survivedTicks)
-        / newHits
-    );
-    match->hits = newHits;
-
-    // If an attempt reaches this hazard while not holding, PATH should first
-    // try a press. If it dies while holding, it should also explore release.
-    match->actionBias += wasHeld ? -1 : 1;
-    match->recommendedHold = match->actionBias >= 0;
-    match->confidence = std::min(
-        1.0f,
-        static_cast<float>(std::abs(match->actionBias))
-            / static_cast<float>(match->hits)
-    );
+    m_population = std::move(next);
 }
 
-void EvolutionSolver::submit(AttemptResult const& result) {
+void FrontierPlanner::submit(AttemptResult const& result) {
     auto& c = m_population.at(m_index);
-    c.progress = std::clamp(result.progress, 0.0f, 100.0f);
+    c.progress = clampValue<float>(result.progress, 0.0f, 100.0f);
+    c.maxX = result.maxX;
     c.survivedTicks = result.survivedTicks;
+    c.deathMode = result.deathMode;
     c.toggles = countToggles(c);
-    c.fitness = score(c.progress, c.survivedTicks, c.toggles);
+    c.fitness = score(result, c.toggles);
 
-    recordDeath(result);
+    if (m_index == 0 || c.progress > m_generationLeaderProgress) {
+        m_generationLeaderProgress = c.progress;
+        m_generationLeaderIndex = m_index;
+    }
 
     if (!m_hasBest || c.fitness > m_best.fitness) {
         m_best = c;
         m_hasBest = true;
+        m_frontierTick = result.survivedTicks > m_cfg.frontierMarginTicks
+            ? result.survivedTicks - m_cfg.frontierMarginTicks
+            : 0;
     }
 
     ++m_index;
+    resetRuntime();
+
+    // Hard generation barrier: breeding starts only after candidate N/N.
     if (m_index < m_population.size()) return;
 
     float generationBest = 0.0f;
@@ -235,232 +364,34 @@ void EvolutionSolver::submit(AttemptResult const& result) {
         generationBest = std::max(generationBest, candidate.progress);
 
     m_generationHistory.push_back(generationBest);
-    if (m_generationHistory.size() > 100)
+    if (m_generationHistory.size() > 120)
         m_generationHistory.erase(m_generationHistory.begin());
 
-    if (generationBest <= m_previousGenerationBest + 0.02f)
-        ++m_stagnantGenerations;
-    else
-        m_stagnantGenerations = 0;
-
-    m_previousGenerationBest = std::max(m_previousGenerationBest, generationBest);
+    float previous = m_generationHistory.size() > 1
+        ? m_generationHistory[m_generationHistory.size() - 2]
+        : -1.0f;
+    if (generationBest <= previous + 0.01f) ++m_stagnantGenerations;
+    else m_stagnantGenerations = 0;
 
     breedNextGeneration();
-    m_index = 0;
     ++m_generation;
+    m_index = 0;
+    m_generationLeaderProgress = 0.0f;
+    m_generationLeaderIndex = 0;
+    resetRuntime();
 }
 
-void EvolutionSolver::submit(float progressPercent, std::uint32_t survivedTicks) {
-    AttemptResult result;
-    result.progress = progressPercent;
-    result.survivedTicks = survivedTicks;
-    result.died = false;
-    submit(result);
-}
-
-Candidate EvolutionSolver::evolutionChild(Candidate const& a, Candidate const& b) {
-    Candidate child = a;
-    clearScore(child);
-
-    if (child.genes.empty()) return child;
-
-    std::uniform_int_distribution<std::size_t> cutDist(0, child.genes.size() - 1);
-    auto cut = cutDist(m_rng);
-    for (std::size_t i = cut; i < child.genes.size(); ++i)
-        child.genes[i] = b.genes[i];
-
-    double adaptive = m_cfg.mutationRate * (1.0 + std::min<std::size_t>(m_stagnantGenerations, 8) * 0.22);
-    std::bernoulli_distribution mutate(adaptive);
-    std::bernoulli_distribution mutateP2(adaptive * 0.45);
-
-    for (auto& gene : child.genes) {
-        if (mutate(m_rng)) gene.p1 = !gene.p1;
-        if (mutateP2(m_rng)) gene.p2 = !gene.p2;
-    }
-
-    std::bernoulli_distribution burst(m_cfg.burstMutationRate);
-    if (burst(m_rng)) {
-        std::uniform_int_distribution<std::size_t> where(0, child.genes.size() - 1);
-        std::uniform_int_distribution<int> length(3, 30);
-        auto start = where(m_rng);
-        auto len = static_cast<std::size_t>(length(m_rng));
-        bool value = !child.genes[start].p1;
-        for (std::size_t i = start; i < std::min(start + len, child.genes.size()); ++i)
-            child.genes[i].p1 = value;
-    }
-
-    return child;
-}
-
-Candidate EvolutionSolver::guidedChild(Candidate const& parent) {
-    Candidate child = parent;
-    clearScore(child);
-    if (child.genes.empty()) return child;
-
-    auto deathGene = std::min<std::size_t>(
-        parent.survivedTicks / m_cfg.decisionEveryTicks,
-        child.genes.size() - 1
-    );
-
-    // The crucial difference from v0.1: GUIDED uses the actual death tick,
-    // not level percent mapped across the whole 8192-gene macro. Everything
-    // well before the failure remains frozen.
-    auto windowStart = deathGene > 110 ? deathGene - 110 : 0;
-    auto windowEnd = std::min<std::size_t>(deathGene + 150, child.genes.size() - 1);
-
-    double localRate = 0.020 + std::min<std::size_t>(m_stagnantGenerations, 10) * 0.004;
-    std::bernoulli_distribution localMut(localRate);
-    std::bernoulli_distribution p2Mut(localRate * 0.35);
-
-    for (std::size_t i = windowStart; i <= windowEnd; ++i) {
-        if (localMut(m_rng)) child.genes[i].p1 = !child.genes[i].p1;
-        if (p2Mut(m_rng)) child.genes[i].p2 = !child.genes[i].p2;
-    }
-
-    // Deterministic probes around the exact place of death make basic jumps
-    // discoverable quickly instead of waiting for a lucky random mutation.
-    static constexpr int shifts[] = {-34, -26, -20, -15, -11, -7, -3, 2, 7, 12};
-    auto serial = m_childSerial++;
-    auto variant = serial % (sizeof(shifts) / sizeof(shifts[0]));
-    auto start = clampIndex(static_cast<long long>(deathGene) + shifts[variant], child.genes.size());
-    auto len = static_cast<std::size_t>(4 + (serial % 5) * 4);
-    bool desired = (serial % 4) != 3; // mostly press probes, sometimes release
-
-    auto restore = parent.genes[std::min(start + len, parent.genes.size() - 1)].p1;
-    for (std::size_t i = start; i < std::min(start + len, child.genes.size()); ++i)
-        child.genes[i].p1 = desired;
-    if (start + len < child.genes.size())
-        child.genes[start + len].p1 = restore;
-
-    return child;
-}
-
-Candidate EvolutionSolver::pathChild(Candidate const& parent) {
-    Candidate child = parent;
-    clearScore(child);
-    if (child.genes.empty()) return child;
-
-    if (m_deathMap.empty())
-        return guidedChild(parent);
-
-    // Prefer the furthest learned obstacle, with repeated deaths adding some
-    // confidence. This is our lightweight approximate hazard map.
-    auto bestIt = m_deathMap.begin();
-    double bestValue = -1.0;
-    for (auto it = m_deathMap.begin(); it != m_deathMap.end(); ++it) {
-        double value = static_cast<double>(it->progress) * 100.0
-            + static_cast<double>(std::min<std::uint32_t>(it->hits, 20)) * 3.0;
-        if (value > bestValue) {
-            bestValue = value;
-            bestIt = it;
-        }
-    }
-
-    auto const& hazard = *bestIt;
-    auto targetGene = std::min<std::size_t>(
-        hazard.tick / m_cfg.decisionEveryTicks,
-        child.genes.size() - 1
-    );
-
-    auto serial = m_childSerial++;
-    static constexpr int lead[] = {6, 9, 12, 15, 18, 22, 27, 32, 38, 45};
-    auto leadTicks = lead[serial % (sizeof(lead) / sizeof(lead[0]))];
-    auto start = clampIndex(static_cast<long long>(targetGene) - leadTicks, child.genes.size());
-    auto len = static_cast<std::size_t>(4 + (serial % 7) * 3);
-
-    bool desired = hazard.recommendedHold;
-    if (serial % 5 == 4) desired = !desired;
-
-    // Most PATH children probe P1. Every sixth one probes P2 as well so dual
-    // sections can eventually build their own successful branch.
-    bool targetP2 = (serial % 6 == 5);
-    bool restore1 = parent.genes[std::min(start + len, parent.genes.size() - 1)].p1;
-    bool restore2 = parent.genes[std::min(start + len, parent.genes.size() - 1)].p2;
-
-    for (std::size_t i = start; i < std::min(start + len, child.genes.size()); ++i) {
-        if (targetP2) child.genes[i].p2 = desired;
-        else child.genes[i].p1 = desired;
-    }
-
-    if (start + len < child.genes.size()) {
-        if (targetP2) child.genes[start + len].p2 = restore2;
-        else child.genes[start + len].p1 = restore1;
-    }
-
-    // Small local exploration after the obstacle. Once a probe clears a spike
-    // the solver should immediately be able to adapt to the next one.
-    auto localEnd = std::min<std::size_t>(targetGene + 100, child.genes.size() - 1);
-    std::bernoulli_distribution local(0.012 + std::min<std::size_t>(m_stagnantGenerations, 8) * 0.003);
-    for (std::size_t i = targetGene; i <= localEnd; ++i) {
-        if (local(m_rng)) child.genes[i].p1 = !child.genes[i].p1;
-    }
-
-    return child;
-}
-
-void EvolutionSolver::breedNextGeneration() {
-    std::sort(m_population.begin(), m_population.end(), [](auto const& a, auto const& b) {
-        return a.fitness > b.fitness;
-    });
-
-    std::vector<Candidate> next;
-    next.reserve(m_cfg.population);
-
-    // Always keep the global best route as the first seed. This guarantees
-    // that learning a new obstacle can never destroy the already solved path.
-    if (m_hasBest) {
-        auto champion = m_best;
-        clearScore(champion);
-        next.push_back(std::move(champion));
-    }
-
-    for (std::size_t i = 0; i < m_cfg.eliteCount && next.size() < m_cfg.population; ++i) {
-        auto elite = m_population[i];
-        clearScore(elite);
-        next.push_back(std::move(elite));
-    }
-
-    std::uniform_int_distribution<std::size_t> chooseElite(0, m_cfg.eliteCount - 1);
-
-    while (next.size() < m_cfg.population) {
-        auto const& a = m_population[chooseElite(m_rng)];
-        Candidate child;
-
-        switch (m_cfg.mode) {
-            case SearchMode::Evolution: {
-                auto const& b = m_population[chooseElite(m_rng)];
-                child = evolutionChild(a, b);
-                break;
-            }
-            case SearchMode::GuidedMutation:
-                child = guidedChild(m_hasBest ? m_best : a);
-                break;
-            case SearchMode::Path:
-                child = pathChild(m_hasBest ? m_best : a);
-                break;
-        }
-
-        next.push_back(std::move(child));
-    }
-
-    m_population = std::move(next);
-}
-
-const Candidate& EvolutionSolver::current() const { return m_population.at(m_index); }
-std::size_t EvolutionSolver::currentIndex() const { return m_index; }
-std::size_t EvolutionSolver::generation() const { return m_generation; }
-std::size_t EvolutionSolver::populationSize() const { return m_population.size(); }
-const Candidate& EvolutionSolver::best() const { return m_best; }
-bool EvolutionSolver::hasBest() const { return m_hasBest; }
-std::uint32_t EvolutionSolver::decisionEveryTicks() const { return m_cfg.decisionEveryTicks; }
-const std::vector<DeathCluster>& EvolutionSolver::deathMap() const { return m_deathMap; }
-const std::vector<float>& EvolutionSolver::generationHistory() const { return m_generationHistory; }
-std::size_t EvolutionSolver::stagnantGenerations() const { return m_stagnantGenerations; }
-
-const Gene& EvolutionSolver::geneForTick(std::uint32_t tick) const {
-    auto idx = static_cast<std::size_t>(tick / m_cfg.decisionEveryTicks);
-    if (idx >= current().genes.size()) idx = current().genes.size() - 1;
-    return current().genes[idx];
-}
+const Candidate& FrontierPlanner::current() const { return m_population.at(m_index); }
+std::size_t FrontierPlanner::currentIndex() const { return m_index; }
+std::size_t FrontierPlanner::generation() const { return m_generation; }
+std::size_t FrontierPlanner::populationSize() const { return m_population.size(); }
+const Candidate& FrontierPlanner::best() const { return m_best; }
+bool FrontierPlanner::hasBest() const { return m_hasBest; }
+std::uint32_t FrontierPlanner::decisionEveryTicks() const { return m_cfg.decisionEveryTicks; }
+std::uint32_t FrontierPlanner::frontierTick() const { return m_frontierTick; }
+float FrontierPlanner::generationLeaderProgress() const { return m_generationLeaderProgress; }
+std::size_t FrontierPlanner::generationLeaderIndex() const { return m_generationLeaderIndex; }
+std::size_t FrontierPlanner::stagnantGenerations() const { return m_stagnantGenerations; }
+const std::vector<float>& FrontierPlanner::generationHistory() const { return m_generationHistory; }
 
 } // namespace omnipath
