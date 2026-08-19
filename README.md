@@ -1,14 +1,17 @@
-# OmniPath
+# OmniPath v0.4
 
-experimental Geometry Dash classic-mode TAS/pathfinder prototype for Geode
+Geode mod for Geometry Dash 2.2081 focused on parallel evolutionary solving
 
-current goal:
-- GD 2.2081
-- Android64 first
-- no platformer
-- AI button on level info screen
-- macro naming
-- evolutionary / guided-mutation search
-- use the game's real PlayLayer for physics instead of a separate 1.x simulator
+## What changed in v0.4
 
-this is an early prototype and is expected to need iteration against real Android builds
+- one generation now runs the whole population at the same time instead of replaying one real player N times
+- every candidate has independent position, velocity, gravity, mode, input state and collision state
+- every candidate is rendered as its own translucent ghost cube
+- cube logic plans around contiguous spike clusters, so double/triple spikes are treated as one jump window
+- ship/wave/ufo/robot/ball/spider/swing have separate controllers and lightweight physics models
+- portals, pads and rings are applied independently per simulated candidate
+- the live Geometry Dash player is only an invulnerable world/camera proxy during training
+- when a shadow candidate reaches the end, its exact input trace is replayed once on real Geometry Dash physics at x1 speed
+- only a replay that actually reaches 100% is stored as the verified solved macro
+
+Android64 builds are published by GitHub Actions to `dist/OmniPath-Android64.geode`

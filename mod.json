@@ -7,8 +7,8 @@
     "ios": "2.2081"
   },
   "id": "openai.omnipath",
-  "name": "OmniPath Prototype",
-  "version": "v0.3.1",
+  "name": "OmniPath",
+  "version": "v0.4.0",
   "developer": "prototype",
-  "description": "Object-aware FRONTIER planner with real 10-100 candidate generations, mode-aware controls, ghost trajectories, touch lock, smart training speed, macro saving, and verified GitHub auto-updates"
+  "description": "Parallel evolutionary solver: every candidate has independent physics/input state and its own ghost cube; obstacle-cluster jumping, mode-aware control, and real-engine verification before a solved macro is accepted"
 }
