@@ -1,4 +1,4 @@
-version=v0.3.1
+version=v0.4.0
 url=https://raw.githubusercontent.com/240peekgg/omnipath/main/dist/OmniPath-Android64.geode
-sha256=1d49e88454617fecbe99bededd3ad2435bdc08464e0e0754784f2c9a44398441
-size=173517
+sha256=dcc2fd49bd85e053949d3716fd2f02e4449103d1154dd6eddc3375525e0f9789
+size=188223
