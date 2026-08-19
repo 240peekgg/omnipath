@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - 'src/**'
+      - 'tests/**'
       - 'mod.json'
       - 'CMakeLists.txt'
       - '.github/workflows/build-android64.yml'
@@ -13,6 +14,7 @@ on:
     branches: [main]
     paths:
       - 'src/**'
+      - 'tests/**'
       - 'mod.json'
       - 'CMakeLists.txt'
       - '.github/workflows/build-android64.yml'
@@ -25,6 +27,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      - name: Evolution core smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          g++ -std=c++23 -O2 -Wall -Wextra -pedantic \
+            -Isrc src/Evolution.cpp tests/evolution_smoke.cpp \
+            -o /tmp/omnipath-evolution-smoke
+          /tmp/omnipath-evolution-smoke
 
       - name: Build Android64 Geode mod
         id: build
@@ -63,12 +74,12 @@ jobs:
           SHA256="$(sha256sum dist/OmniPath-Android64.geode | awk '{print $1}')"
           SIZE="$(stat -c '%s' dist/OmniPath-Android64.geode)"
 
-          cat > dist/update.txt <<EOF
+          cat > dist/update.txt <<EOF2
           version=${VERSION}
           url=https://raw.githubusercontent.com/240peekgg/omnipath/main/dist/OmniPath-Android64.geode
           sha256=${SHA256}
           size=${SIZE}
-          EOF
+          EOF2
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

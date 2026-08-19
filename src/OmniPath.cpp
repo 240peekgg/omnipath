@@ -1,5 +1,0 @@
-#include "OmniPathPart1.inc"
-#include "OmniPathPart2.inc"
-#include "OmniPathPart3.inc"
-#include "OmniPathPart4.inc"
-#include "OmniPathPart5.inc"

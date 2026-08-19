@@ -8,7 +8,7 @@
   },
   "id": "openai.omnipath",
   "name": "OmniPath",
-  "version": "v0.4.0",
+  "version": "v0.5.0",
   "developer": "prototype",
-  "description": "Parallel evolutionary solver: every candidate has independent physics/input state and its own ghost cube; obstacle-cluster jumping, mode-aware control, and real-engine verification before a solved macro is accepted"
+  "description": "Parallel evolutionary Geometry Dash solver with pure-random first-generation exploration, direct input genomes, strict swept shadow collisions, independent agents, polished training UI, and real-engine verification before accepting a solution"
 }
