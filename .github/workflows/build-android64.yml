@@ -3,7 +3,7 @@ name: Build Android64
 on:
   workflow_dispatch:
   push:
-    branches: [main, v0.3-frontier-planner]
+    branches: [main]
     paths:
       - 'src/**'
       - 'mod.json'
@@ -39,8 +39,8 @@ jobs:
           name: OmniPath-Android64
           path: ${{ steps.build.outputs.build-output }}
 
-      - name: Publish .geode into repository
-        if: github.event_name == 'push'
+      - name: Publish .geode and update manifest
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
         run: |
           set -euo pipefail
@@ -53,9 +53,26 @@ jobs:
             test -n "$FOUND"
             cp "$FOUND" dist/OmniPath-Android64.geode
           fi
+
+          VERSION="$(python3 - <<'PY'
+          import json
+          with open('mod.json', 'r', encoding='utf-8') as f:
+              print(json.load(f)['version'])
+          PY
+          )"
+          SHA256="$(sha256sum dist/OmniPath-Android64.geode | awk '{print $1}')"
+          SIZE="$(stat -c '%s' dist/OmniPath-Android64.geode)"
+
+          cat > dist/update.txt <<EOF
+          version=${VERSION}
+          url=https://raw.githubusercontent.com/240peekgg/omnipath/main/dist/OmniPath-Android64.geode
+          sha256=${SHA256}
+          size=${SIZE}
+          EOF
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add dist/OmniPath-Android64.geode
+          git add dist/OmniPath-Android64.geode dist/update.txt
           git diff --cached --quiet && exit 0
-          git commit -m "publish Android64 build [skip ci]"
+          git commit -m "publish Android64 ${VERSION} [skip ci]"
           git push
