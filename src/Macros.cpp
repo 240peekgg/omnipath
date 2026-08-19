@@ -8,7 +8,7 @@ namespace omnipath::app {
 void saveCandidateMacro(
     omnipath::Candidate const& candidate,
     bool verified,
-    std::string const& suffix = ""
+    std::string const& suffix
 ) {
     if (!g_live.evolution) return;
 

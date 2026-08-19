@@ -20,7 +20,7 @@ std::string sanitizeName(std::string name) {
     return name;
 }
 
-std::string percentText(float value, int precision = 1) {
+std::string percentText(float value, int precision) {
     std::ostringstream stream;
     stream << std::fixed << std::setprecision(precision) << value;
     return stream.str();
